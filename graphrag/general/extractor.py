@@ -19,12 +19,11 @@ from collections import defaultdict, Counter
 from copy import deepcopy
 from typing import Callable
 import trio
-import random
-import time
+import networkx as nx
 
 from graphrag.general.graph_prompt import SUMMARIZE_DESCRIPTIONS_PROMPT
 from graphrag.utils import get_llm_cache, set_llm_cache, handle_single_entity_extraction, \
-    handle_single_relationship_extraction, split_string_by_multi_markers, flat_uniq_list, chat_limiter
+    handle_single_relationship_extraction, split_string_by_multi_markers, flat_uniq_list, chat_limiter, get_from_to, GraphChange
 from rag.llm.chat_model import Base as CompletionLLM
 from rag.prompts import message_fit_in
 from rag.utils import truncate
@@ -42,65 +41,24 @@ class Extractor:
         llm_invoker: CompletionLLM,
         language: str | None = "English",
         entity_types: list[str] | None = None,
-        get_entity: Callable | None = None,
-        set_entity: Callable | None = None,
-        get_relation: Callable | None = None,
-        set_relation: Callable | None = None,
     ):
         self._llm = llm_invoker
         self._language = language
         self._entity_types = entity_types or DEFAULT_ENTITY_TYPES
-        self._get_entity_ = get_entity
-        self._set_entity_ = set_entity
-        self._get_relation_ = get_relation
-        self._set_relation_ = set_relation
 
-    async def _chat(self, system, history, gen_conf):
+    def _chat(self, system, history, gen_conf):
         hist = deepcopy(history)
         conf = deepcopy(gen_conf)
         response = get_llm_cache(self._llm.llm_name, system, hist, conf)
         if response:
             return response
-            
-        # Implement exponential backoff retry strategy
-        max_retries = 3  # Maximum of 3 retry attempts
-        base_delay = 1.0  # Initial delay of 1 second
-        
-        for attempt in range(max_retries):
-            try:
-                # Use upstream's max_length value (0.92 instead of 0.97)
-                _, system_msg = message_fit_in([{"role": "system", "content": system}], int(self._llm.max_length * 0.92))
-                response = self._llm.chat(system_msg[0]["content"], hist, conf)
-                response = re.sub(r"<think>.*</think>", "", response, flags=re.DOTALL)
-                
-                # Check for error in response
-                if response.find("**ERROR**") >= 0:
-                    raise Exception(response)
-                
-                # Successfully received response, set cache and return
-                set_llm_cache(self._llm.llm_name, system, response, history, gen_conf)
-                return response
-                
-            except Exception as e:
-                error_str = str(e)
-                # Check if it's a rate limit error
-                if (("429" in error_str or 
-                     "rate limit" in error_str.lower() or 
-                     "tpm limit" in error_str.lower() or
-                     "too many requests" in error_str.lower()) and
-                    attempt < max_retries - 1):  # Only retry if not the last attempt
-                    
-                    # Calculate backoff time - exponential growth strategy
-                    delay = base_delay * (2 ** attempt) + random.uniform(0, 0.5)
-                    logging.warning(f"Rate limit hit. Retrying in {delay:.2f} seconds... (Attempt {attempt+1}/{max_retries})")
-                    await trio.sleep(delay)
-                    continue
-                else:
-                    # For non-rate limit errors or last attempt, raise immediately
-                    raise
-        
-        # If maximum retry attempts reached, return error message
-        raise Exception(f"Failed after {max_retries} attempts due to rate limiting.")
+        _, system_msg = message_fit_in([{"role": "system", "content": system}], int(self._llm.max_length * 0.92))
+        response = self._llm.chat(system_msg[0]["content"], hist, conf)
+        response = re.sub(r"<think>.*</think>", "", response, flags=re.DOTALL)
+        if response.find("**ERROR**") >= 0:
+            raise Exception(response)
+        set_llm_cache(self._llm.llm_name, system, response, history, gen_conf)
+        return response
 
     def _entities_and_relations(self, chunk_key: str, records: list, tuple_delimiter: str):
         maybe_nodes = defaultdict(list)
@@ -187,25 +145,15 @@ class Extractor:
     async def _merge_nodes(self, entity_name: str, entities: list[dict], all_relationships_data):
         if not entities:
             return
-        already_entity_types = []
-        already_source_ids = []
-        already_description = []
-
-        already_node = self._get_entity_(entity_name)
-        if already_node:
-            already_entity_types.append(already_node["entity_type"])
-            already_source_ids.extend(already_node["source_id"])
-            already_description.append(already_node["description"])
-
         entity_type = sorted(
             Counter(
-                [dp["entity_type"] for dp in entities] + already_entity_types
+                [dp["entity_type"] for dp in entities]
             ).items(),
             key=lambda x: x[1],
             reverse=True,
         )[0][0]
         description = GRAPH_FIELD_SEP.join(
-            sorted(set([dp["description"] for dp in entities] + already_description))
+            sorted(set([dp["description"] for dp in entities]))
         )
         already_source_ids = flat_uniq_list(entities, "source_id")
         description = await self._handle_entity_relation_summary(entity_name, description)
@@ -215,7 +163,6 @@ class Extractor:
             source_id=already_source_ids,
         )
         node_data["entity_name"] = entity_name
-        self._set_entity_(entity_name, node_data)
         all_relationships_data.append(node_data)
 
     async def _merge_edges(
@@ -227,36 +174,11 @@ class Extractor:
     ):
         if not edges_data:
             return
-        already_weights = []
-        already_source_ids = []
-        already_description = []
-        already_keywords = []
-
-        relation = self._get_relation_(src_id, tgt_id)
-        if relation:
-            already_weights = [relation["weight"]]
-            already_source_ids = relation["source_id"]
-            already_description = [relation["description"]]
-            already_keywords = relation["keywords"]
-
-        weight = sum([dp["weight"] for dp in edges_data] + already_weights)
-        description = GRAPH_FIELD_SEP.join(
-            sorted(set([dp["description"] for dp in edges_data] + already_description))
-        )
-        keywords = flat_uniq_list(edges_data, "keywords") + already_keywords
-        source_id = flat_uniq_list(edges_data, "source_id") + already_source_ids
-
-        for need_insert_id in [src_id, tgt_id]:
-            if self._get_entity_(need_insert_id):
-                continue
-            self._set_entity_(need_insert_id, {
-                        "source_id": source_id,
-                        "description": description,
-                        "entity_type": 'UNKNOWN'
-                    })
-        description = await self._handle_entity_relation_summary(
-            f"({src_id}, {tgt_id})", description
-        )
+        weight = sum([edge["weight"] for edge in edges_data])
+        description = GRAPH_FIELD_SEP.join(sorted(set([edge["description"] for edge in edges_data])))
+        description = await self._handle_entity_relation_summary(f"{src_id} -> {tgt_id}", description)
+        keywords = flat_uniq_list(edges_data, "keywords")
+        source_id = flat_uniq_list(edges_data, "source_id")
         edge_data = dict(
             src_id=src_id,
             tgt_id=tgt_id,
@@ -265,9 +187,41 @@ class Extractor:
             weight=weight,
             source_id=source_id
         )
-        self._set_relation_(src_id, tgt_id, edge_data)
-        if all_relationships_data is not None:
-            all_relationships_data.append(edge_data)
+        all_relationships_data.append(edge_data)
+
+    async def _merge_graph_nodes(self, graph: nx.Graph, nodes: list[str], change: GraphChange):
+        if len(nodes) <= 1:
+            return
+        change.added_updated_nodes.add(nodes[0])
+        change.removed_nodes.extend(nodes[1:])
+        nodes_set = set(nodes)
+        node0_attrs = graph.nodes[nodes[0]]
+        node0_neighbors = set(graph.neighbors(nodes[0]))
+        for node1 in nodes[1:]:
+            # Merge two nodes, keep "entity_name", "entity_type", "page_rank" unchanged.
+            node1_attrs = graph.nodes[node1]
+            node0_attrs["description"] += f"{GRAPH_FIELD_SEP}{node1_attrs['description']}"
+            for attr in ["keywords", "source_id"]:
+                node0_attrs[attr] = sorted(set(node0_attrs[attr].extend(node1_attrs[attr])))
+            for neighbor in graph.neighbors(node1):
+                change.removed_edges.add(get_from_to(node1, neighbor))
+                if neighbor not in nodes_set:
+                    edge1_attrs = graph.get_edge_data(node1, neighbor)
+                    if neighbor in node0_neighbors:
+                        # Merge two edges
+                        change.added_updated_edges.add(get_from_to(nodes[0], neighbor))
+                        edge0_attrs = graph.get_edge_data(nodes[0], neighbor)
+                        edge0_attrs["weight"] += edge1_attrs["weight"]
+                        edge0_attrs["description"] += f"{GRAPH_FIELD_SEP}{edge1_attrs['description']}"
+                        edge0_attrs["keywords"] = list(set(edge0_attrs["keywords"].extend(edge1_attrs["keywords"])))
+                        edge0_attrs["source_id"] = list(set(edge0_attrs["source_id"].extend(edge1_attrs["source_id"])))
+                        edge0_attrs["description"] = await self._handle_entity_relation_summary(f"({nodes[0]}, {neighbor})", edge0_attrs["description"])
+                        graph.add_edge(nodes[0], neighbor, **edge0_attrs)
+                    else:
+                        graph.add_edge(nodes[0], neighbor, **edge1_attrs)
+            graph.remove_node(node1)
+        node0_attrs["description"] = await self._handle_entity_relation_summary(nodes[0], node0_attrs["description"])
+        graph.nodes[nodes[0]].update(node0_attrs)
 
     async def _handle_entity_relation_summary(
             self,
@@ -288,5 +242,5 @@ class Extractor:
         use_prompt = prompt_template.format(**context_base)
         logging.info(f"Trigger summary: {entity_or_relation_name}")
         async with chat_limiter:
-            summary = await self._chat(use_prompt, [{"role": "user", "content": "Output: "}], {"temperature": 0.8})
+            summary = await trio.to_thread.run_sync(lambda: self._chat(use_prompt, [{"role": "user", "content": "Output: "}], {"temperature": 0.8}))
         return summary
